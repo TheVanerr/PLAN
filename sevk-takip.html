@@ -230,7 +230,6 @@
   .typeseg input:focus-visible + span { outline: 2px solid var(--accent); }
   .formbtns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
   .dlg-body p { margin: 0; color: var(--muted); }
-  .dlg-body p.err { color: var(--red); font-weight: 500; }
   .btn.danger { background: var(--red); color: #fff; border-color: transparent; font-weight: 600; }
 
   .toast { position: fixed; left: 50%; bottom: calc(22px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%) translateY(20px); opacity: 0; background: var(--board); color: var(--board-text); padding: 10px 16px; border-radius: 12px; font-size: 14px; box-shadow: var(--shadow-lift); transition: opacity .2s, transform .2s; pointer-events: none; z-index: 50; max-width: calc(100vw - 32px); }
@@ -316,7 +315,6 @@
     <button class="btn" id="csvBtn" type="button">Excel'e Aktar (CSV)</button>
     <input type="file" id="importFile" accept=".json,application/json" hidden>
     <span class="sp" id="storeNote"></span>
-    <button class="btn" id="logoutBtn" type="button">Çıkış yap</button>
   </div>
 </div>
 
@@ -356,16 +354,6 @@
   </form>
 </dialog>
 
-<dialog id="login">
-  <form id="loginForm" class="dlg-body">
-    <h2>Giriş</h2>
-    <p>Kayıtları görmek için şifrenizi girin. Bu bilgisayarda bir kez sorulur.</p>
-    <label class="f">Şifre<input type="password" id="loginPass" autocomplete="current-password" required></label>
-    <p id="loginErr" class="err" hidden></p>
-    <div class="formbtns"><button type="submit" class="btn primary" id="loginBtn">Giriş yap</button></div>
-  </form>
-</dialog>
-
 <dialog id="ask">
   <div class="dlg-body">
     <h2 id="askTitle"></h2>
@@ -383,14 +371,9 @@ let items = [];
 let filter = 'aktif';
 let dayFilter = null;
 let editId = null;
-let mode = 'wait';           // wait | cloud | offline | login
-
-// Veritabanı: Cloudflare Worker (api/ klasörü). Şifre kodda değil, her tarayıcıda bir kez girilir.
-const API_URL = 'https://mini-api.thevanerr.workers.dev';
-const API_BASE = API_URL + '/v1/sevk-takip/items';
-const TOKEN_KEY = 'sevkTakip.token';
-const CACHE_KEY = 'sevkTakip.cache';
-const POLL_MS = 15000;
+let mode = 'wait';           // wait | cloud | local
+let col = null;              // db koleksiyonu (bulut modunda)
+let dl = null;               // downloads yeteneği (artifact içinde)
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -425,86 +408,54 @@ function splitMs(ms) {
   return { d: Math.floor(s / 86400), h: Math.floor(s % 86400 / 3600), m: Math.floor(s % 3600 / 60), s: s % 60 };
 }
 
-/* ---------- Depolama: Cloudflare Worker + D1 ---------- */
-function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
-function lsSet(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} }
-const getToken = () => lsGet(TOKEN_KEY) || '';
-function loadCache() { try { return JSON.parse(lsGet(CACHE_KEY)) || []; } catch { return []; } }
-const saveCache = () => lsSet(CACHE_KEY, JSON.stringify(items));
+/* ---------- Depolama: bulut (artifact db) veya bu tarayıcı ---------- */
+function loadLocal() { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; } }
+function saveLocal() { try { localStorage.setItem(KEY, JSON.stringify(items)); } catch { toast('Kayıt yapılamadı: tarayıcı depolaması kapalı olabilir.'); } }
 function clean(it) { const o = {}; for (const k of ['type','title','customer','ref','date','priority','start','owner','note','done','doneAt']) o[k] = it[k] ?? ''; o.done = !!it.done; return o; }
 
-async function api(path, opts = {}, token = getToken()) {
-  const r = await fetch(API_BASE + path, { ...opts, headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } });
-  if (!r.ok) { const e = new Error('http ' + r.status); e.status = r.status; throw e; }
-  return r.json();
+async function putItem(it) {
+  if (mode === 'cloud') {
+    try { await col.doc(it.id).set(clean(it)); } catch (e) { cloudError(e); }
+  } else saveLocal();
 }
-
-let pending = 0;        // gönderilmeyi bekleyen yazma sayısı; bu sırada sunucudan gelen liste uygulanmaz
-let lastSig = '';
-async function pull() {
-  if (!getToken()) return askLogin();
-  if (pending) return;
-  try {
-    const res = await api('');
-    if (pending) return;
-    const sig = JSON.stringify(res.items);
-    if (mode !== 'cloud') setMode('cloud');
-    if (sig === lastSig) return;
-    lastSig = sig;
-    items = res.items.map(x => ({ ...x.data, id: x.id }));
-    saveCache(); render();
-  } catch (e) {
-    if (e.status === 401) return askLogin(true);
-    setMode('offline');
-  }
+async function removeItem(id) {
+  if (mode === 'cloud') {
+    try { await col.doc(id).delete(); } catch (e) { cloudError(e); }
+  } else saveLocal();
 }
-
-async function write(path, opts) {
-  pending++;
-  saveCache();
-  try { await api(path, opts); return true; }
-  catch (e) {
-    if (e.status === 401) askLogin(true);
-    else toast('Kaydedilemedi. İnternet bağlantınızı kontrol edip tekrar deneyin.');
-    lastSig = '';
-    return false;
-  }
-  finally { pending--; if (!pending) pull(); }
+function cloudError(e) {
+  if (e && e.code === 'quota_exceeded') toast('Depolama dolu. Eski tamamlanmış kayıtları silip tekrar deneyin.');
+  else if (e && e.code === 'invalid_argument') toast('Bu sayfada düzenleme yetkiniz yok.');
+  else toast('Buluta kaydedilemedi. Bağlantıyı kontrol edip tekrar deneyin.');
 }
-const putItem = it => write('/' + encodeURIComponent(it.id), { method: 'PUT', body: JSON.stringify(clean(it)) });
-const removeItem = id => write('/' + encodeURIComponent(id), { method: 'DELETE' });
 
 function setMode(m) {
   mode = m;
   const el = $('#sync');
-  el.className = 'sync ' + (m === 'cloud' ? 'cloud' : m === 'wait' ? '' : 'local');
-  el.querySelector('span').textContent = { cloud: 'Senkron', wait: 'Bağlanıyor…', offline: 'Bağlantı yok', login: 'Giriş gerekli' }[m];
-  $('#storeNote').textContent = m === 'offline'
-    ? 'Sunucuya ulaşılamıyor. Son görülen liste gösteriliyor; bağlantı gelince otomatik güncellenir.'
-    : 'Kayıtlar bulutta tutulur. Bu sayfayı açtığınız her bilgisayarda aynı liste görünür, değişiklikler birkaç saniye içinde yansır.';
+  el.className = 'sync ' + (m === 'cloud' ? 'cloud' : m === 'local' ? 'local' : '');
+  el.querySelector('span').textContent = m === 'cloud' ? 'Bulutta senkron' : m === 'local' ? 'Sadece bu bilgisayar' : 'Bağlanıyor…';
+  $('#storeNote').textContent = m === 'cloud'
+    ? 'Kayıtlar bulutta tutulur; bu sayfayı açtığınız her bilgisayarda aynı liste görünür ve anında güncellenir.'
+    : 'Kayıtlar yalnızca bu bilgisayardaki tarayıcıda saklanır. Düzenli yedek almanız önerilir.';
 }
 
-function askLogin(wrong) {
-  setMode('login');
-  const d = $('#login');
-  $('#loginErr').hidden = !wrong;
-  $('#loginErr').textContent = 'Şifre hatalı. Tekrar deneyin.';
-  if (!d.open) { d.showModal(); $('#loginPass').focus(); }
+async function initStore() {
+  // Yerel dosya olarak açıldıysa doğrudan tarayıcı depolaması; yayınlanmış sayfada bulut deposunu bekle
+  let tries = 0;
+  while (location.protocol !== 'file:' && !(window.claude && window.claude.use) && tries++ < 30) await new Promise(r => setTimeout(r, 100));
+  if (!(window.claude && window.claude.use)) { items = loadLocal(); setMode('local'); render(); return; }
+  setMode('wait');
+  window.claude.use('downloads').then(x => { dl = x; }).catch(() => {});
+  let db = null;
+  try { db = await window.claude.use('db'); } catch {}
+  if (!db) { items = loadLocal(); setMode('local'); render(); return; }
+  col = db.collection('items');
+  col.onSnapshot(snap => {
+    items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (mode !== 'cloud') setMode('cloud');
+    render();
+  }, () => { setMode('local'); toast('Bulut bağlantısı kesildi. Sayfayı yenileyin.'); });
 }
-$('#loginForm').addEventListener('submit', async e => {
-  e.preventDefault();
-  const t = $('#loginPass').value.trim(); if (!t) return;
-  const btn = $('#loginBtn'); btn.disabled = true;
-  try {
-    await api('', {}, t);
-    lsSet(TOKEN_KEY, t); $('#login').close(); $('#loginPass').value = '';
-    lastSig = ''; setMode('wait'); await pull(); toast('Giriş yapıldı');
-  } catch (err) {
-    $('#loginErr').hidden = false;
-    $('#loginErr').textContent = err.status === 401 ? 'Şifre hatalı. Tekrar deneyin.' : 'Sunucuya ulaşılamadı. İnternet bağlantınızı kontrol edin.';
-  } finally { btn.disabled = false; }
-});
-$('#login').addEventListener('cancel', e => e.preventDefault());
 
 /* ---------- Çizim ---------- */
 const ICON = {
@@ -803,7 +754,12 @@ $('#dayFilter').addEventListener('click', e => { if (e.target.id === 'clearDay')
 $('#q').addEventListener('input', renderList);
 
 /* ---------- Yedek / CSV ---------- */
-function download(name, text, mime) {
+async function download(name, text, mime) {
+  if (dl) {
+    try { await dl.save({ filename: name, data: text }); toast('Dosya kaydedildi'); }
+    catch (e) { if (e && e.code !== 'declined') toast('Dosya indirilemedi.'); }
+    return;
+  }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([text], { type: mime }));
   a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
@@ -824,13 +780,11 @@ $('#importFile').onchange = async e => {
   if (choice === 'replace') items = data.slice();
   else { const ids = new Set(items.map(i => i.id)); items = items.concat(data.filter(i => !ids.has(i.id))); }
   render();
-  pending++;   // aktarım bitene kadar sunucudan gelen yarım liste ekrana basılmasın
-  let ok = true;
-  try {
-    if (choice === 'replace') for (const o of old) if (!items.some(i => i.id === o.id)) ok = await removeItem(o.id) && ok;
-    for (const it of items) if (choice === 'replace' || !old.includes(it)) ok = await putItem(it) && ok;
-  } finally { pending--; lastSig = ''; pull(); }
-  toast(ok ? `${data.length} kayıt yüklendi` : 'Bazı kayıtlar yüklenemedi. Bağlantıyı kontrol edip tekrar deneyin.');
+  if (mode === 'cloud') {
+    if (choice === 'replace') for (const o of old) if (!items.some(i => i.id === o.id)) await removeItem(o.id);
+    for (const it of items) if (choice === 'replace' || !old.includes(it)) await putItem(it);
+  } else saveLocal();
+  toast(`${data.length} kayıt yüklendi`);
 };
 $('#csvBtn').onclick = () => {
   const head = ['Tür', 'Başlık', 'Müşteri', 'Sipariş/Seri No', 'Tarih', 'Kalan Gün', 'Kalan İş Günü', 'Öncelik', 'Sorumlu', 'Durum', 'Not'];
@@ -843,18 +797,9 @@ $('#csvBtn').onclick = () => {
   download(`sevk-takip-${toISO(todayDate())}.csv`, '﻿' + csv, 'text/csv');
 };
 
-$('#logoutBtn').onclick = async () => {
-  if (await ask('Bu bilgisayarda çıkış yapılsın mı?', 'Kayıtlar silinmez. Tekrar girmek için şifre gerekir.', [['Vazgeç', false], ['Çıkış yap', true, 'danger']]) !== true) return;
-  lsSet(TOKEN_KEY, null); lsSet(CACHE_KEY, null); items = []; lastSig = ''; render(); askLogin();
-};
-
-items = loadCache();       // son görülen liste hemen görünsün, ardından sunucudan tazelensin
-setMode('wait');
+setMode(location.protocol === 'file:' ? 'local' : 'wait');
 render();
-pull();
-setInterval(() => { if (!document.hidden && mode !== 'login') pull(); }, POLL_MS);
-document.addEventListener('visibilitychange', () => { if (!document.hidden && mode !== 'login') pull(); });
-window.addEventListener('online', () => { if (mode !== 'login') pull(); });
+initStore();
 </script>
 </body>
 </html>

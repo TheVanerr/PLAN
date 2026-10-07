@@ -1,9 +1,0 @@
-{
-  "name": "mini-api",
-  "main": "src/index.js",
-  "compatibility_date": "2026-10-01",
-  "d1_databases": [
-    { "binding": "DB", "database_name": "mini-db", "database_id": "5344d430-2785-491b-888e-7494e92c7158" }
-  ],
-  "vars": { "ALLOWED_ORIGINS": "*" }
-}
